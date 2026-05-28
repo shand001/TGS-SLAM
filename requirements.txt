@@ -1,0 +1,17 @@
+cyclonedds
+imageio
+kornia
+lpips
+matplotlib
+natsort
+open3d==0.16.0
+opencv-python
+pandas
+Pillow
+plyfile
+pytorch-msssim
+PyYAML
+torchmetrics
+tqdm==4.65.0
+wandb
+numpy==1.26.4

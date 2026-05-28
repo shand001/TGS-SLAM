@@ -1,0 +1,16 @@
+dataset: 'scannetpp'
+c_planes_res:
+  coarse: 0.24
+  fine: 0.005
+  bound_dividable: 0.24
+s_planes_res:
+  coarse: 0.24
+  fine: 0.03
+model:
+  c_dim: 16
+lr:
+  decoders_lr: 0.001
+  c_planes_lr: 0.005
+  s_planes_lr: 0.005
+lr_first_factor: 5
+lr_factor: 1

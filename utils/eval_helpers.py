@@ -1,0 +1,1453 @@
+import cv2
+import os
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
+import numpy as np
+import matplotlib.pyplot as plt
+from gsplat import rasterization as rasterization
+from datasets.gradslam_datasets.geometryutils import relative_transformation
+from utils.recon_helpers import setup_camera,to_gsplat_camera
+from utils.slam_external import build_rotation,calc_psnr
+from utils.slam_helpers import (transform_to_frame, transformed_params2rendervar,
+                                transformed_params2depthplussilhouette,
+                                transformed_semantics2rendervar,params_to_gsplat_inputs)
+
+from pytorch_msssim import ms_ssim
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from typing import Optional, Tuple
+loss_fn_alex = LearnedPerceptualImagePatchSimilarity(net_type='alex', normalize=True).cuda()
+
+def align(model, data):
+    """Align two trajectories using the method of Horn (closed-form).
+
+    Args:
+        model -- first trajectory (3xn)
+        data -- second trajectory (3xn)
+
+    Returns:
+        rot -- rotation matrix (3x3)
+        trans -- translation vector (3x1)
+        trans_error -- translational error per point (1xn)
+
+    """
+    np.set_printoptions(precision=3, suppress=True)
+    model_zerocentered = model - model.mean(1).reshape((3,-1))
+    data_zerocentered = data - data.mean(1).reshape((3,-1))
+
+    W = np.zeros((3, 3))
+    for column in range(model.shape[1]):
+        W += np.outer(model_zerocentered[:,
+                         column], data_zerocentered[:, column])
+    U, d, Vh = np.linalg.linalg.svd(W.transpose())
+    S = np.matrix(np.identity(3))
+    if (np.linalg.det(U) * np.linalg.det(Vh) < 0):
+        S[2, 2] = -1
+    rot = U*S*Vh
+    trans = data.mean(1).reshape((3,-1)) - rot * model.mean(1).reshape((3,-1))
+
+    model_aligned = rot * model + trans
+    alignment_error = model_aligned - data
+
+    trans_error = np.sqrt(np.sum(np.multiply(
+        alignment_error, alignment_error), 0)).A[0]
+
+    return rot, trans, trans_error
+
+###############
+
+def _voc_colormap(n=256, device=None):
+    cmap = torch.zeros(n, 3, dtype=torch.uint8, device=device)  # 放到指定 device
+    for i in range(n):
+        r = g = b = 0
+        c = i
+        for j in range(8):
+            r |= ((c >> 0) & 1) << (7 - j)
+            g |= ((c >> 1) & 1) << (7 - j)
+            b |= ((c >> 2) & 1) << (7 - j)
+            c >>= 3
+        cmap[i] = torch.tensor([r, g, b], dtype=torch.uint8, device=device)
+    return cmap
+
+def _fixed_palette(device=None):
+    """Return the fixed palette requested for semantic visualization.
+    Colors are in uint8 RGB. Length covers provided entries.
+    """
+    arr = np.array([
+        (0, 0, 0),
+        (174, 199, 232), (152, 223, 138), (31, 119, 180), (255, 187, 120), (188, 189, 34),
+        (140, 86, 75), (255, 152, 150), (214, 39, 40), (197, 176, 213), (148, 103, 189),
+        (196, 156, 148), (23, 190, 207), (178, 76, 76), (247, 182, 210), (66, 188, 102),
+        (219, 219, 141), (140, 57, 197), (202, 185, 52), (51, 176, 203), (200, 54, 131),
+        (92, 193, 61), (78, 71, 183), (172, 114, 82), (255, 127, 14), (91, 163, 138),
+        (153, 98, 156), (140, 153, 101), (158, 218, 229), (100, 125, 154), (178, 127, 135),
+        (120, 185, 128), (146, 111, 194), (44, 160, 44), (112, 128, 144), (96, 207, 209),
+        (227, 119, 194), (213, 92, 176), (94, 106, 211), (82, 84, 163), (100, 85, 144),
+        (100, 218, 200), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128),
+        (128, 0, 128), (0, 128, 128), (128, 128, 128), (64, 0, 0), (192, 0, 0),
+        (192, 128, 0), (64, 0, 128)
+    ], dtype=np.uint8)
+    t = torch.from_numpy(arr)
+    if device is not None:
+        t = t.to(device)
+    return t
+
+def _labels_to_color(labels_hw: torch.Tensor, palette: torch.Tensor):
+    if labels_hw.ndim != 2:
+        raise ValueError(f"labels must be [H, W], got {labels_hw.shape}")
+    labels = labels_hw.to(torch.long)
+    if palette.device != labels.device:
+        palette = palette.to(labels.device)            # 关键：把 palette 移到 labels 的 device
+    color_hwc = palette[labels]                        # [H, W, 3], uint8
+    return color_hwc.permute(2, 0, 1).contiguous()  
+
+
+def visualize_semantic_from_logits(rendered_logits: torch.Tensor,
+                                   gt_seg: torch.Tensor,
+                                   num_classes: int = -1,
+                                   palette: Optional[torch.Tensor] = None,
+                                   temperature: float = 1.0):
+    C, H, W = rendered_logits.shape
+    probs = torch.softmax(rendered_logits / temperature, dim=0)
+    pred_labels = probs.argmax(dim=0)                  # 可能在 CUDA 上
+
+    if gt_seg.ndim == 3 and gt_seg.shape[0] == 1:
+        gt_seg = gt_seg[0]
+    gt_labels = gt_seg.to(torch.long).to(pred_labels.device)
+
+    # palette 放到 pred_labels 的 device。使用固定配色以匹配需求。
+    if palette is None:
+        base = _fixed_palette(device=pred_labels.device)
+        # 依据需要的类别数进行裁剪或扩展
+        inferred_classes = max(int(pred_labels.max().item()) + 1,
+                               int(gt_labels.max().item()) + 1)
+        K = inferred_classes if num_classes is None or num_classes <= 0 else max(num_classes, inferred_classes)
+        if base.shape[0] >= K:
+            palette = base[:K]
+        else:
+            # 若类别超过提供的颜色数，使用 VOC colormap 进行补齐
+            extra = _voc_colormap(max(256, K), device=pred_labels.device)[:K]
+            palette = extra
+    else:
+        palette = palette.to(pred_labels.device)
+
+    pred_color = _labels_to_color(pred_labels, palette)  # [3,H,W], uint8, same device
+    gt_color   = _labels_to_color(gt_labels,   palette)
+
+    # 如果你后面要把 palette 跨帧保存到 CPU，可在返回前 .cpu()
+    return pred_color, gt_color, palette
+###############
+def recolor_semantic_img(rendered_seg, gt_seg, color_map=None):
+    """Adjust the semantic color by assigning to the closest color refer to
+       the ground truth semantic image or color dict.
+    """
+    rendered_seg = rendered_seg.permute(1, 2, 0) # (3, H, W) -> (H, W, 3)
+    gt_seg = gt_seg.permute(1, 2, 0)
+    img_shape = gt_seg.shape
+    rendered_seg = rendered_seg.reshape(-1, 1, 3).type(torch.float32) # (H*W, 1, 3)
+
+    if color_map is None:
+        gt_seg = gt_seg.reshape(-1, 3)
+        # Find unique colors
+        color_map, _ = torch.unique(gt_seg, dim=0, return_inverse=True)
+    refer_color = color_map.reshape(1, -1, 3).type(torch.float32).to(gt_seg.device) # (1, H*W, 3)
+
+    # l1_distances = torch.sum(torch.abs(rendered_seg - refer_color), axis=2)
+    l1_distances = torch.sqrt(torch.sum((rendered_seg - refer_color) ** 2, axis=2))
+    # Find the index of the minimum distance for each pixel
+    closest_indices = torch.argmin(l1_distances, axis=1)
+    del l1_distances
+
+    # Assign the closest color to the rendered semantic image
+    rendered_seg[:, 0, :] = refer_color.squeeze(0)[closest_indices]
+    rendered_seg = rendered_seg.reshape(img_shape) # (H*W, 1, 3) -> (H, W, 3)
+    rendered_seg = rendered_seg.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
+    
+    return rendered_seg
+
+
+def evaluate_label_miou(pred_label, gt_label):
+    """
+    Input : 
+        pred_label: torch tensor of the predicted semantic label, shape (1, H, W)
+        gt_label: torch tensor of the semantic label, shape (1, H, W)
+    """
+    gt_flat = gt_label.view(-1)
+    pred_flat = pred_label.view(-1)
+
+    unique_labels = torch.unique(gt_flat)
+    iou_per_label = []
+
+    for label in unique_labels:
+        # Skip unlabeled class if necessary (e.g., label == 0)
+        if label == 0:
+            continue
+
+        gt_label = (gt_flat == label)
+        pred_label = (pred_flat == label)
+        intersection = torch.logical_and(gt_label, pred_label).sum().item()
+        union = torch.logical_or(gt_label, pred_label).sum().item()
+
+        if union == 0:
+            continue
+
+        iou = intersection / union
+        iou_per_label.append(iou)
+
+    # Mean IoU
+    miou = sum(iou_per_label) / len(iou_per_label) if iou_per_label else 0
+    return miou
+
+
+def evaluate_miou(recolored_img, gt_img):
+    """
+    Input : 
+        recolored_img: torch tensor of the colored semantic image, shape (C, H, W)
+        gt_img: torch tensor of the colored semantic image, shape (C, H, W)
+    """
+    gt_flat = gt_img.permute(1, 2, 0).view(-1, 3)
+    pred_flat = recolored_img.permute(1, 2, 0).view(-1, 3)
+
+    # Filter out [0, 0, 0] (unlabeled) pixels
+    labeled_pixels = (gt_flat != torch.tensor([0, 0, 0], dtype=torch.uint8).cuda()).any(dim=1)
+    gt_flat = gt_flat[labeled_pixels]
+    pred_flat = pred_flat[labeled_pixels]
+
+    unique_colors = torch.unique(gt_flat, dim=0)
+    iou_per_color = []
+
+    for color in unique_colors:
+        # Skip the unlabeled color
+        if torch.equal(color, torch.tensor([0, 0, 0], dtype=torch.uint8).cuda()):
+            continue
+
+        gt_matches = torch.all(gt_flat == color, dim=1)
+        pred_matches = torch.all(pred_flat == color, dim=1)
+
+        # Calculate intersection and union
+        intersection = torch.logical_and(gt_matches, pred_matches).sum().item()
+        union = torch.logical_or(gt_matches, pred_matches).sum().item()
+
+        if union == 0:
+            continue
+
+        iou = intersection / union
+        iou_per_color.append(iou)
+
+    # Calculate mean IoU
+    miou = sum(iou_per_color) / len(iou_per_color) if iou_per_color else 0
+    return miou
+
+
+
+def evaluate_miou_onehot(pred_onehot: torch.Tensor,
+                  gt_ids: torch.Tensor,
+                  ignore_index: int = None,
+                  present_only: bool = True):
+    """
+    计算单幅图像的 mIoU（可返回每类 IoU）
+    
+    参数：
+        pred_onehot: (C, H, W) 预测 one-hot（或近似 one-hot），未 softmax
+        gt_ids:      (1, H, W) 语义 GT 的类别索引（int）
+        ignore_index: 忽略的类别索引（如 255 或 0），无则设为 None
+        present_only: True 时仅对 GT 中实际出现过的类取平均；False 时对所有类（union>0）取平均
+    
+    返回：
+        miou: float 标量
+        iou_per_class: (C,) 张量（对没有有效像素的类为 NaN）
+    """
+    
+    # print("pred_onehot",pred_onehot.shape)
+    # print("gt_ids",gt_ids.shape)
+    
+    
+    
+    assert pred_onehot.dim() == 3, "pred_onehot must be (C,H,W)"
+    assert gt_ids.dim() == 3 and gt_ids.size(0) == 1, "gt_ids must be (1,H,W)"
+
+    C, H, W = pred_onehot.shape
+    device = pred_onehot.device
+
+    # 1) 从 one-hot 取类别索引：(H, W)
+    pred_labels = pred_onehot.argmax(dim=0)
+
+    # 2) GT 去掉 batch 维：(H, W)
+    gt = gt_ids.squeeze(0)
+
+    # 3) 有效像素掩码（过滤 ignore_index，且保证 gt 索引在 [0, C-1]）
+    valid = torch.ones((H, W), dtype=torch.bool, device=device)
+    if ignore_index is not None:
+        valid &= (gt != ignore_index)
+    valid &= (gt >= 0) & (gt < C)
+
+    if valid.sum() == 0:
+        # 没有可评估像素
+        return 0.0, torch.full((C,), float('nan'), device=device)
+
+    gt_valid = gt[valid].to(torch.long)
+    pred_valid = pred_labels[valid].to(torch.long)
+
+    # 4) 混淆矩阵（C x C）
+    # 行为 GT 类别，列为预测类别
+    idx = gt_valid * C + pred_valid
+    conf = torch.bincount(idx, minlength=C*C).reshape(C, C)
+
+    # 5) per-class IoU
+    intersection = conf.diag()
+    union = conf.sum(dim=1) + conf.sum(dim=0) - intersection
+    # 避免除零：对 union==0 的类设为 NaN
+    iou = intersection.float() / union.clamp_min(1).float()
+    iou = torch.where(union > 0, iou, torch.full_like(iou, float('nan')))
+
+    # 6) 选哪些类参与平均
+    if present_only:
+        # 仅统计 GT 中出现过的类（行和 > 0）
+        present = conf.sum(dim=1) > 0
+        selected = present & (union > 0)
+    else:
+        # 统计所有有 union 的类
+        selected = union > 0
+
+    if selected.any():
+        miou = torch.nanmean(iou[selected]).item()
+    else:
+        miou = 0.0
+
+    return miou, iou
+
+
+
+
+
+
+def evaluate_ate(gt_traj, est_traj):
+    """
+    Input : 
+        gt_traj: list of 4x4 matrices 
+        est_traj: list of 4x4 matrices
+        len(gt_traj) == len(est_traj)
+    """
+    gt_traj_pts = [gt_traj[idx][:3,3] for idx in range(len(gt_traj))]
+    est_traj_pts = [est_traj[idx][:3,3] for idx in range(len(est_traj))]
+
+    gt_traj_pts  = torch.stack(gt_traj_pts).detach().cpu().numpy().T
+    est_traj_pts = torch.stack(est_traj_pts).detach().cpu().numpy().T
+
+    _, _, trans_error = align(gt_traj_pts, est_traj_pts)
+
+    avg_trans_error = trans_error.mean()
+
+    return avg_trans_error
+
+
+def report_loss(losses, wandb_run, wandb_step, tracking=False, mapping=False, load_semantics=False):
+    # Update loss dict
+    loss_dict = {'Loss': losses['loss'].item(),
+                 'Image Loss': losses['im'].item(),
+                 'Depth Loss': losses['depth'].item(),}
+    # Log semantic loss if available and enabled
+    if load_semantics and ('seg' in losses):
+        loss_dict['Semantic Loss'] = losses['seg'].item()
+    
+    if tracking:
+        tracking_loss_dict = {}
+        for k, v in loss_dict.items():
+            tracking_loss_dict[f"Per Iteration Tracking/{k}"] = v
+        tracking_loss_dict['Per Iteration Tracking/step'] = wandb_step
+        wandb_run.log(tracking_loss_dict)
+    elif mapping:
+        mapping_loss_dict = {}
+        for k, v in loss_dict.items():
+            mapping_loss_dict[f"Per Iteration Mapping/{k}"] = v
+        mapping_loss_dict['Per Iteration Mapping/step'] = wandb_step
+        wandb_run.log(mapping_loss_dict)
+    else:
+        frame_opt_loss_dict = {}
+        for k, v in loss_dict.items():
+            frame_opt_loss_dict[f"Per Iteration Current Frame Optimization/{k}"] = v
+        frame_opt_loss_dict['Per Iteration Current Frame Optimization/step'] = wandb_step
+        wandb_run.log(frame_opt_loss_dict)
+    
+    # Increment wandb step
+    wandb_step += 1
+    return wandb_step
+        
+
+def plot_rgbd_silhouette(color, depth, rastered_color, rastered_depth, presence_sil_mask, diff_depth_l1,
+                         psnr, depth_l1, fig_title, plot_dir=None, plot_name=None, save_plot=False, seg=None,
+                         rastered_seg=None, wandb_run=None, wandb_step=None, wandb_title=None, diff_rgb=None,use_one_hot_semantics=False,miou=0.0):
+    # Ensure silhouette mask is 2D for visualization
+    if isinstance(presence_sil_mask, torch.Tensor):
+        presence_sil_mask = presence_sil_mask.detach().cpu().numpy()
+    presence_sil_mask = np.squeeze(presence_sil_mask)
+    # Determine Plot Aspect Ratio
+    aspect_ratio = color.shape[2] / color.shape[1]
+    fig_height = 8
+    fig_width = 14/1.55
+    # Adjust number of subplots and figure size based on 'seg' variable
+    num_cols = 4 if seg is not None else 3
+    # Scale width for additional column if seg is not None
+    fig_width = fig_width * aspect_ratio * num_cols / 3
+    # Plot the Ground Truth and Rasterized RGB & Depth,
+    # along with Diff Depth & Silhouette, and semantic image
+    fig, axs = plt.subplots(2, num_cols, figsize=(fig_width, fig_height))
+    axs[0, 0].imshow(color.cpu().permute(1, 2, 0))
+    axs[0, 0].set_title("Ground Truth RGB")
+    axs[0, 1].imshow(depth[0, :, :].cpu(), cmap='jet', vmin=0, vmax=6)
+    axs[0, 1].set_title("Ground Truth Depth")
+    rastered_color = torch.clamp(rastered_color, 0, 1)
+    axs[1, 0].imshow(rastered_color.cpu().permute(1, 2, 0))
+    axs[1, 0].set_title("Rasterized RGB, PSNR: {:.2f}".format(psnr))
+    axs[1, 1].imshow(rastered_depth[0, :, :].cpu(), cmap='jet', vmin=0, vmax=6)
+    axs[1, 1].set_title("Rasterized Depth, L1: {:.2f}".format(depth_l1))
+    if diff_rgb is not None:
+        axs[0, 2].imshow(diff_rgb.cpu(), cmap='jet', vmin=0, vmax=6)
+        axs[0, 2].set_title("Diff RGB L1")
+    else:
+        axs[0, 2].imshow(presence_sil_mask, cmap='gray')
+        axs[0, 2].set_title("Rasterized Silhouette")
+    diff_depth_l1 = diff_depth_l1.cpu().squeeze(0)
+    axs[1, 2].imshow(diff_depth_l1, cmap='jet', vmin=0, vmax=6)
+    axs[1, 2].set_title("Diff Depth L1")
+    
+    
+    
+    
+    ####################################################暂时不可视化图片
+    if seg is not None:
+        if use_one_hot_semantics:
+            # Allow either raw logits+labels or pre-colored semantic maps.
+            if seg.ndim == 3 and seg.shape[0] == 3:
+                seg_vis = seg
+                rastered_seg_vis = rastered_seg
+            else:
+                pred_color, gt_color, _ = visualize_semantic_from_logits(
+                    rendered_logits=rastered_seg,
+                    gt_seg=seg,
+                    num_classes=-1,
+                    temperature=1.0,
+                )
+                seg_vis = gt_color
+                rastered_seg_vis = pred_color
+        else:
+            rastered_seg = recolor_semantic_img(rastered_seg, seg)
+            seg_vis = seg
+            rastered_seg_vis = rastered_seg
+
+        axs[0, 3].imshow(seg_vis.cpu().permute(1, 2, 0))
+        axs[0, 3].set_title("Ground Truth Semantic Map")
+        axs[1, 3].imshow(rastered_seg_vis.cpu().permute(1, 2, 0))
+        axs[1, 3].set_title("Rasterized Semantic Map, IOU: {:.4f}".format(miou))
+        
+    for ax in axs.flatten():
+        ax.axis('off')
+    fig.suptitle(fig_title, y=0.95, fontsize=16)
+    fig.tight_layout()
+    if save_plot:
+        save_path = os.path.join(plot_dir, f"{plot_name}.png")
+        plt.savefig(save_path, bbox_inches='tight')
+    if wandb_run is not None:
+        if wandb_step is None:
+            wandb_run.log({wandb_title: fig})
+        else:
+            wandb_run.log({wandb_title: fig}, step=wandb_step)
+    plt.close()
+
+
+def report_progress(params, data, i, progress_bar, iter_time_idx, sil_thres, every_i=1, qual_every_i=1, 
+                    tracking=False, mapping=False, device="cuda", load_semantics=False, wandb_run=None,
+                    wandb_step=None, wandb_save_qual=False, online_time_idx=None, global_logging=True, use_one_hot_semantics=False):
+    if i % every_i == 0 or i == 1:
+        if wandb_run is not None:
+            if tracking:
+                stage = "Tracking"
+            elif mapping:
+                stage = "Mapping"
+            else:
+                stage = "Current Frame Optimization"
+        if not global_logging:
+            stage = "Per Iteration " + stage
+
+        if tracking:
+            # Get list of gt poses
+            gt_w2c_list = data['iter_gt_w2c_list']
+            valid_gt_w2c_list = []
+            
+            # Get latest trajectory
+            latest_est_w2c = data['w2c']
+            latest_est_w2c_list = []
+            latest_est_w2c_list.append(latest_est_w2c)
+            valid_gt_w2c_list.append(gt_w2c_list[0])
+            for idx in range(1, iter_time_idx+1):
+                # Check if gt pose is not nan for this time step
+                if torch.isnan(gt_w2c_list[idx]).sum() > 0:
+                    continue
+                interm_cam_rot = F.normalize(params['cam_unnorm_rots'][..., idx].detach())
+                interm_cam_trans = params['cam_trans'][..., idx].detach()
+                intermrel_w2c = torch.eye(4).to(device).float()
+                intermrel_w2c[:3, :3] = build_rotation(interm_cam_rot)
+                intermrel_w2c[:3, 3] = interm_cam_trans
+                latest_est_w2c = intermrel_w2c
+                latest_est_w2c_list.append(latest_est_w2c)
+                valid_gt_w2c_list.append(gt_w2c_list[idx])
+
+            # Get latest gt pose
+            gt_w2c_list = valid_gt_w2c_list
+            iter_gt_w2c = gt_w2c_list[-1]
+            # Get euclidean distance error between latest and gt pose
+            iter_pt_error = torch.sqrt((latest_est_w2c[0,3] - iter_gt_w2c[0,3])**2 + (latest_est_w2c[1,3] - iter_gt_w2c[1,3])**2 + (latest_est_w2c[2,3] - iter_gt_w2c[2,3])**2)
+            if iter_time_idx > 0:
+                # Calculate relative pose error
+                rel_gt_w2c = relative_transformation(gt_w2c_list[-2], gt_w2c_list[-1])
+                rel_est_w2c = relative_transformation(latest_est_w2c_list[-2], latest_est_w2c_list[-1])
+                rel_pt_error = torch.sqrt((rel_gt_w2c[0,3] - rel_est_w2c[0,3])**2 + (rel_gt_w2c[1,3] - rel_est_w2c[1,3])**2 + (rel_gt_w2c[2,3] - rel_est_w2c[2,3])**2)
+            else:
+                rel_pt_error = torch.zeros(1).float()
+            
+            # Calculate ATE RMSE
+            ate_rmse = evaluate_ate(gt_w2c_list, latest_est_w2c_list)
+            ate_rmse = np.round(ate_rmse, decimals=6)
+            if wandb_run is not None:
+                tracking_log = {f"{stage}/Latest Pose Error":iter_pt_error, 
+                               f"{stage}/Latest Relative Pose Error":rel_pt_error,
+                               f"{stage}/ATE RMSE":ate_rmse}
+
+        # Get current frame Gaussians
+        transformed_pts = transform_to_frame(params, iter_time_idx, 
+                                             gaussians_grad=False,
+                                             camera_grad=False,
+                                             device=device)
+
+        # Initialize Render Variables
+
+
+        if load_semantics and not use_one_hot_semantics:
+            
+            rendervar = transformed_params2rendervar(params, transformed_pts, device=device)
+            depth_sil_rendervar = transformed_params2depthplussilhouette(params, data['w2c'], 
+                                                                        transformed_pts, device=device)
+            depth_sil, _, _, = Renderer(raster_settings=data['cam'])(**depth_sil_rendervar)
+            rastered_depth = depth_sil[0, :, :].unsqueeze(0)
+            valid_depth_mask = (data['depth'] > 0)
+            silhouette = depth_sil[1, :, :]
+            presence_sil_mask = (silhouette > sil_thres)
+
+            im, _, _, = Renderer(raster_settings=data['cam'])(**rendervar)
+            
+            
+            
+            semantic_rendervar = transformed_semantics2rendervar(params, transformed_pts, device=device)
+            rastered_seg, _, _, = Renderer(raster_settings=data['cam'])(**semantic_rendervar)
+            gt_seg = data['semantic_color']
+            # seg_psnr = calc_psnr(seg, data['semantic_color']).mean()
+            rastered_seg = recolor_semantic_img(rastered_seg, gt_seg)
+            miou = evaluate_miou(rastered_seg, gt_seg)
+            
+            
+            
+        elif load_semantics and use_one_hot_semantics:
+            
+
+            mean, quat, scale, opac, color = params_to_gsplat_inputs(params, transformed_pts,use_semantics=load_semantics,use_one_hot_semantics=use_one_hot_semantics)
+            H,W,K,view=data['gscam']
+            RGBDS, alpha, meta = rasterization(
+                    mean, quat, scale, opac, color, view, K, W, H,
+                    render_mode="RGB+D")
+            im = RGBDS[..., :3]  # 取RGB部分，[1,1200,680,3]
+            # print("im shape before squeeze:", im.shape)
+            im = im.squeeze(0)               # 去掉第一维的1，变成 [1200, 680, 3]
+            im = im.permute(2, 0, 1)
+            rendered_seg = RGBDS[..., 3:-1]
+            rendered_seg = rendered_seg.squeeze(0).permute(2,0,1)
+            depth = RGBDS[..., -1]  # 取深度部分，[1,1200,680]
+            rastered_depth= depth.squeeze(0)  
+            valid_depth_mask = (data['depth'] > 0)
+            gt_seg = data['semantic_id']
+            silhouette = alpha[0] if alpha.ndim==4 else alpha
+            silhouette = silhouette.squeeze(0).permute(2,0,1)           # 去掉第一维的1，变成 [1200, 680]
+            presence_sil_mask = (silhouette > sil_thres)
+            
+            
+            miou,iou = evaluate_miou_onehot(rendered_seg, gt_seg)
+
+        
+            
+            
+            
+            
+            
+            
+        else:
+            rastered_seg = None
+            gt_seg = None
+            miou = 0
+
+        if tracking:
+            psnr = calc_psnr(im * presence_sil_mask, data['im'] * presence_sil_mask).mean()
+        else:
+            psnr = calc_psnr(im, data['im']).mean()
+
+        if tracking:
+            diff_depth_rmse = torch.sqrt((((rastered_depth - data['depth']) * presence_sil_mask) ** 2))
+            diff_depth_rmse = diff_depth_rmse * valid_depth_mask
+            rmse = diff_depth_rmse.sum() / valid_depth_mask.sum()
+            diff_depth_l1 = torch.abs((rastered_depth - data['depth']) * presence_sil_mask)
+            diff_depth_l1 = diff_depth_l1 * valid_depth_mask
+            depth_l1 = diff_depth_l1.sum() / valid_depth_mask.sum()
+        else:
+            diff_depth_rmse = torch.sqrt((((rastered_depth - data['depth'])) ** 2))
+            diff_depth_rmse = diff_depth_rmse * valid_depth_mask
+            rmse = diff_depth_rmse.sum() / valid_depth_mask.sum()
+            diff_depth_l1 = torch.abs((rastered_depth - data['depth']))
+            diff_depth_l1 = diff_depth_l1 * valid_depth_mask
+            depth_l1 = diff_depth_l1.sum() / valid_depth_mask.sum()
+
+        if not (tracking or mapping):
+            progress_bar.set_postfix({f"Time-Step: {iter_time_idx} | PSNR: {psnr:.{7}} | Depth RMSE: {rmse:.{7}} | mIoU: {miou:.{7}} | L1": f"{depth_l1:.{7}}"})
+            progress_bar.update(every_i)
+        elif tracking:
+            progress_bar.set_postfix({f"Time-Step: {iter_time_idx} | Rel Pose Error: {rel_pt_error.item():.{7}} | Pose Error: {iter_pt_error.item():.{7}} | ATE RMSE": f"{ate_rmse.item():.{7}}"})
+            progress_bar.update(every_i)
+        elif mapping:
+            progress_bar.set_postfix({f"Time-Step: {online_time_idx} | Frame {data['id']} | PSNR: {psnr:.{7}} | Depth RMSE: {rmse:.{7}} | mIoU: {miou:.{7}} | L1": f"{depth_l1:.{7}}"})
+            progress_bar.update(every_i)
+        
+        if wandb_run is not None:
+            wandb_log = {f"{stage}/PSNR": psnr,
+                         f"{stage}/Depth RMSE": rmse,
+                         f"{stage}/Depth L1": depth_l1,
+                         f"{stage}/mIoU": miou,
+                         f"{stage}/step": wandb_step}
+            if tracking:
+                wandb_log = {**wandb_log, **tracking_log}
+            wandb_run.log(wandb_log)
+        
+        if wandb_save_qual and (i % qual_every_i == 0 or i == 1):
+            # Silhouette Mask
+            presence_sil_mask = presence_sil_mask.detach().cpu().numpy()
+
+            # Log plot to wandb
+            if not mapping:
+                fig_title = f"Time-Step: {iter_time_idx} | Iter: {i} | Frame: {data['id']}"
+            else:
+                fig_title = f"Time-Step: {online_time_idx} | Iter: {i} | Frame: {data['id']}"
+            plot_rgbd_silhouette(data['im'], data['depth'], im, rastered_depth, presence_sil_mask, diff_depth_l1,
+                                 psnr, depth_l1, fig_title, seg=gt_seg, rastered_seg=rastered_seg, wandb_run=wandb_run,
+                                 wandb_step=wandb_step, wandb_title=f"{stage} Qual Viz")
+
+
+def eval_online(dataset, all_params, num_frames, eval_online_dir, sil_thres, mapping_iters,
+                add_new_gaussians, device="cuda", load_semantics=False, wandb_run=None,
+                wandb_save_qual=False, eval_every=1):
+    print("Evaluating Online Final Parameters...")
+    psnr_list = []
+    rmse_list = []
+    l1_list = []
+    miou_list = []
+    plot_dir = os.path.join(eval_online_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    for time_idx in tqdm(range(num_frames)):
+        if time_idx != 0 and (time_idx+1) % eval_every != 0:
+            continue
+        # Get Params for current frame
+        params = all_params[time_idx]
+
+        if load_semantics:
+            color, depth, intrinsics, pose, semantic_id, semantic_color = dataset[time_idx]
+            semantic_id = semantic_id.permute(2, 0, 1) # (H, W, 1) -> (1, H, W)
+            semantic_color = semantic_color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
+        else:
+            color, depth, intrinsics, pose = dataset[time_idx]
+
+        # Get Camera Parameters
+        intrinsics = intrinsics[:3, :3]
+
+        # Process RGB-D Data
+        color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
+        depth = depth.permute(2, 0, 1) # (H, W, C) -> (C, H, W)
+
+        if time_idx == 0:
+            # Process Camera Parameters
+            first_frame_w2c = torch.linalg.inv(pose)
+            # Setup Camera
+            cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(),
+                               first_frame_w2c.detach().cpu().numpy(), device=device)
+        
+        # Define current frame data
+        curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': time_idx, 'intrinsics': intrinsics, 'w2c': first_frame_w2c}
+
+        if load_semantics:
+            curr_data['semantic_id'] = semantic_id
+            curr_data['semantic_color'] = semantic_color
+
+        # Get current frame Gaussians
+        transformed_pts = transform_to_frame(params, time_idx, 
+                                             gaussians_grad=False,
+                                             camera_grad=False,
+                                             device=device)
+
+        # Initialize Render Variables
+        rendervar = transformed_params2rendervar(params, transformed_pts, device=device)
+        depth_sil_rendervar = transformed_params2depthplussilhouette(params, first_frame_w2c,
+                                                                     transformed_pts, device=device)
+        
+        # Render Depth & Silhouette
+        depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
+        rastered_depth = depth_sil[0, :, :].unsqueeze(0)
+        valid_depth_mask = (curr_data['depth'] > 0)
+        silhouette = depth_sil[1, :, :]
+        presence_sil_mask = (silhouette > sil_thres)
+        
+        # Render RGB and Calculate PSNR
+        im, radius, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+        if mapping_iters==0 and not add_new_gaussians:
+            psnr = calc_psnr(im * presence_sil_mask, curr_data['im'] * presence_sil_mask).mean()
+        else:
+            psnr = calc_psnr(im, curr_data['im']).mean()
+        psnr_list.append(psnr.cpu().numpy())
+
+        # Compute Depth RMSE
+        if mapping_iters==0 and not add_new_gaussians:
+            diff_depth_rmse = torch.sqrt((((rastered_depth - curr_data['depth']) * presence_sil_mask) ** 2))
+            diff_depth_rmse = diff_depth_rmse * valid_depth_mask
+            rmse = diff_depth_rmse.sum() / valid_depth_mask.sum()
+            diff_depth_l1 = torch.abs((rastered_depth - curr_data['depth']) * presence_sil_mask)
+            diff_depth_l1 = diff_depth_l1 * valid_depth_mask
+            depth_l1 = diff_depth_l1.sum() / valid_depth_mask.sum()
+        else:
+            diff_depth_rmse = torch.sqrt((((rastered_depth - curr_data['depth'])) ** 2))
+            diff_depth_rmse = diff_depth_rmse * valid_depth_mask
+            rmse = diff_depth_rmse.sum() / valid_depth_mask.sum()
+            diff_depth_l1 = torch.abs((rastered_depth - curr_data['depth']))
+            diff_depth_l1 = diff_depth_l1 * valid_depth_mask
+            depth_l1 = diff_depth_l1.sum() / valid_depth_mask.sum()
+        rmse_list.append(rmse.cpu().numpy())
+        l1_list.append(depth_l1.cpu().numpy())
+
+        if load_semantics:
+            # Render semantic color map
+            semantic_rendervar = transformed_semantics2rendervar(params, transformed_pts, device=device)
+            rastered_seg, _, _, = Renderer(raster_settings=curr_data['cam'])(**semantic_rendervar)
+            gt_seg = curr_data['semantic_color']
+
+            # Calcualte mIoU scores
+            rastered_seg = recolor_semantic_img(rastered_seg, gt_seg)
+            miou = evaluate_miou(rastered_seg, gt_seg)
+            miou_list.append(miou)
+        else:
+            rastered_seg = None
+            gt_seg = None
+
+        # Plot the Ground Truth and Rasterized RGB & Depth, along with Silhouette
+        fig_title = "Time Step: {}".format(time_idx)
+        plot_name = "%04d" % time_idx
+        presence_sil_mask = presence_sil_mask.detach().cpu().numpy()
+        if wandb_run is None:
+            plot_rgbd_silhouette(color, depth, im, rastered_depth, presence_sil_mask, diff_depth_l1,
+                                 psnr, depth_l1, fig_title, plot_dir, plot_name=plot_name, save_plot=True,
+                                 seg=gt_seg, rastered_seg=rastered_seg)
+        elif wandb_save_qual:
+            plot_rgbd_silhouette(color, depth, im, rastered_depth, presence_sil_mask, diff_depth_l1,
+                                 psnr, depth_l1, fig_title, plot_dir, plot_name=plot_name, save_plot=True,
+                                 seg=gt_seg, rastered_seg=rastered_seg, wandb_run=wandb_run, wandb_step=None, 
+                                 wandb_title="Online Eval/Qual Viz")
+    
+    # Compute Average Metrics
+    psnr_list = np.array(psnr_list)
+    rmse_list = np.array(rmse_list)
+    l1_list = np.array(l1_list)
+    miou_list = np.array(miou_list)
+    avg_psnr = psnr_list.mean()
+    avg_rmse = rmse_list.mean()
+    avg_l1 = l1_list.mean()
+    avg_miou = miou_list.mean() if miou_list.size > 0 else 0
+    print("Online Average PSNR: {:.2f}".format(avg_psnr))
+    print("Online Average Depth RMSE: {:.2f}".format(avg_rmse))
+    print("Online Average Depth L1: {:.2f}".format(avg_l1))
+    print("Average mIoU: {:.4f}".format(avg_miou))
+
+    if wandb_run is not None:
+        wandb_run.log({"Final Stats/Online Average PSNR": avg_psnr, 
+                       "Final Stats/Online Average Depth RMSE": avg_rmse,
+                       "Final Stats/Online Average Depth L1": avg_l1,
+                       "Final Stats/step": 1,
+                       "Final Stats/Average mIoU": avg_miou})
+
+    # Save metric lists as text files
+    np.savetxt(os.path.join(eval_online_dir, "online_psnr.txt"), psnr_list)
+    np.savetxt(os.path.join(eval_online_dir, "online_rmse.txt"), rmse_list)
+    np.savetxt(os.path.join(eval_online_dir, "online_l1.txt"), l1_list)
+
+    if load_semantics:
+        np.savetxt(os.path.join(eval_dir, "miou.txt"), miou_list)
+
+        fig, axs = plt.subplots(1, 3, figsize=(18, 4))
+        axs[2].plot(np.arange(len(miou_list)), miou_list)
+        axs[2].set_title("mIoU")
+        axs[2].set_xlabel("Time Step")
+        axs[2].set_ylabel("mIoU")
+    else:
+        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+
+    # Plot PSNR & L1 as line plots
+    axs[0].plot(np.arange(len(psnr_list)), psnr_list)
+    axs[0].set_title("RGB PSNR")
+    axs[0].set_xlabel("Time Step")
+    axs[0].set_ylabel("PSNR")
+    axs[1].plot(np.arange(len(l1_list)), l1_list)
+    axs[1].set_title("Depth L1")
+    axs[1].set_xlabel("Time Step")
+    axs[1].set_ylabel("L1")
+    fig.suptitle("Average PSNR: {:.2f}, Average Depth L1: {:.2f}, Average mIoU: {:.4f}".format(avg_psnr, avg_l1, avg_miou),
+                 y=1.05, fontsize=16)
+    plt.savefig(os.path.join(eval_online_dir, "online_metrics.png"), bbox_inches='tight')
+    if wandb_run is not None:
+        wandb_run.log({"Online Eval/Metrics": fig})
+    plt.close()
+
+
+def eval(dataset, final_params, num_frames, eval_dir, sil_thres, mapping_iters,
+         add_new_gaussians, device="cuda", load_semantics=False, wandb_run=None,
+         wandb_save_qual=False, eval_every=1, save_frames=False,
+         use_one_hot_semantics=False, num_semantic_classes=None):
+    print("Evaluating Final Parameters ...")
+    psnr_list = []
+    rmse_list = []
+    l1_list = []
+    lpips_list = []
+    ssim_list = []
+    miou_list = []
+    plot_dir = os.path.join(eval_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    if save_frames:
+        render_rgb_dir = os.path.join(eval_dir, "rendered_rgb")
+        os.makedirs(render_rgb_dir, exist_ok=True)
+        render_depth_dir = os.path.join(eval_dir, "rendered_depth")
+        os.makedirs(render_depth_dir, exist_ok=True)
+        # rgb_dir = os.path.join(eval_dir, "rgb")
+        # os.makedirs(rgb_dir, exist_ok=True)
+        # depth_dir = os.path.join(eval_dir, "depth")
+        # os.makedirs(depth_dir, exist_ok=True)
+        
+        if load_semantics:
+            render_seg_dir = os.path.join(eval_dir, "rendered_seg")
+            os.makedirs(render_seg_dir, exist_ok=True)
+
+    gt_w2c_list = []
+    for time_idx in tqdm(range(num_frames)):
+         # Get RGB-D Data & Camera Parameters
+        if load_semantics:
+            color, depth, intrinsics, pose, semantic_id, semantic_color = dataset[time_idx]
+            semantic_id = semantic_id.permute(2, 0, 1) # (H, W, 1) -> (1, H, W)
+            semantic_color = semantic_color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
+        else:
+            color, depth, intrinsics, pose = dataset[time_idx]
+        gt_w2c = torch.linalg.inv(pose)
+        gt_w2c_list.append(gt_w2c)
+        intrinsics = intrinsics[:3, :3]
+
+        # Process RGB-D Data
+        color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
+        depth = depth.permute(2, 0, 1) # (H, W, C) -> (C, H, W)
+
+        if time_idx == 0:
+            # Process Camera Parameters
+            first_frame_w2c = torch.linalg.inv(pose)
+            # Setup Camera
+            cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(),
+                               first_frame_w2c.detach().cpu().numpy(), device=device)
+        
+            gs_cam = to_gsplat_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(),
+                               first_frame_w2c.detach().cpu().numpy(), device=device)
+        # Skip frames if not eval_every
+        if time_idx != 0 and (time_idx+1) % eval_every != 0:
+            continue
+
+        # Get current frame Gaussians
+        transformed_pts = transform_to_frame(final_params, time_idx, 
+                                             gaussians_grad=False,
+                                             camera_grad=False,
+                                             device=device)
+ 
+        # Define current frame data
+        curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': time_idx, 'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'gscam': gs_cam}
+
+        if load_semantics:
+            curr_data['semantic_id'] = semantic_id
+            curr_data['semantic_color'] = semantic_color
+
+
+        if not use_one_hot_semantics:
+        # if True:
+        # Initialize Render Variables
+            rendervar = transformed_params2rendervar(final_params, transformed_pts, device=device)
+            depth_sil_rendervar = transformed_params2depthplussilhouette(final_params, curr_data['w2c'],
+                                                                        transformed_pts, device=device)
+
+            # Render Depth & Silhouette
+            depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
+            rastered_depth = depth_sil[0, :, :].unsqueeze(0)
+            # Mask invalid depth in GT
+            valid_depth_mask = (curr_data['depth'] > 0)
+            rastered_depth_viz = rastered_depth.detach()
+            rastered_depth = rastered_depth * valid_depth_mask
+            silhouette = depth_sil[1, :, :]
+            presence_sil_mask = (silhouette > sil_thres)
+            print(presence_sil_mask.shape)
+            # Render RGB and Calculate PSNR
+            im, radius, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+            
+            
+        else:
+            mean, quat, scale, opac, renders = params_to_gsplat_inputs(final_params, transformed_pts,use_semantics=load_semantics,use_one_hot_semantics=use_one_hot_semantics)
+            H,W,K,view=curr_data['gscam']
+            RGBDS, alpha, meta = rasterization(
+                    mean, quat, scale, opac, renders, view, K, W, H,
+                    render_mode="RGB+D")
+            im = RGBDS[..., :3]  # 取RGB部分，[1,1200,680,3]
+            # print("im shape before squeeze:", im.shape)
+            im = im.squeeze(0)               # 去掉第一维的1，变成 [1200, 680, 3]
+            im = im.permute(2, 0, 1)
+            rastered_seg = RGBDS[..., 3:-1]
+            rastered_seg = rastered_seg.squeeze(0).permute(2,0,1)
+            valid_depth_mask = (curr_data['depth'] > 0)
+     
+            rastered_depth = RGBDS[..., -1]  # 取深度部分，[1,1200,680]
+            # rastered_depth= depth.squeeze(0)
+            rastered_depth_viz = rastered_depth.detach()
+            rastered_depth = rastered_depth * valid_depth_mask
+            silhouette = alpha[0] if alpha.ndim==4 else alpha
+            silhouette = silhouette.squeeze(0).permute(2,0,1).squeeze(0)           # 去掉第一维的1，变成 [1200, 680]
+            presence_sil_mask = (silhouette > sil_thres)
+            # print(presence_sil_mask.shape)
+        
+        if mapping_iters==0 and not add_new_gaussians:
+            weighted_im = im * presence_sil_mask * valid_depth_mask
+            weighted_gt_im = curr_data['im'] * presence_sil_mask * valid_depth_mask
+        else:
+            weighted_im = im * valid_depth_mask
+            weighted_gt_im = curr_data['im'] * valid_depth_mask
+        psnr = calc_psnr(weighted_im, weighted_gt_im).mean()
+        ssim = ms_ssim(weighted_im.unsqueeze(0).cpu(), weighted_gt_im.unsqueeze(0).cpu(),
+                       data_range=1.0, size_average=True)
+        loss_fn_alex.to(device)
+        lpips_score = loss_fn_alex(torch.clamp(weighted_im.unsqueeze(0), 0.0, 1.0),
+                                    torch.clamp(weighted_gt_im.unsqueeze(0), 0.0, 1.0)).item()
+
+        psnr_list.append(psnr.cpu().numpy())
+        ssim_list.append(ssim.cpu().numpy())
+        lpips_list.append(lpips_score)
+
+        # Compute Depth RMSE
+        if mapping_iters==0 and not add_new_gaussians:
+            diff_depth_rmse = torch.sqrt((((rastered_depth - curr_data['depth']) * presence_sil_mask) ** 2))
+            diff_depth_rmse = diff_depth_rmse * valid_depth_mask
+            rmse = diff_depth_rmse.sum() / valid_depth_mask.sum()
+            diff_depth_l1 = torch.abs((rastered_depth - curr_data['depth']) * presence_sil_mask)
+            diff_depth_l1 = diff_depth_l1 * valid_depth_mask
+            depth_l1 = diff_depth_l1.sum() / valid_depth_mask.sum()
+        else:
+            diff_depth_rmse = torch.sqrt((((rastered_depth - curr_data['depth'])) ** 2))
+            diff_depth_rmse = diff_depth_rmse * valid_depth_mask
+            rmse = diff_depth_rmse.sum() / valid_depth_mask.sum()
+            diff_depth_l1 = torch.abs((rastered_depth - curr_data['depth']))
+            diff_depth_l1 = diff_depth_l1 * valid_depth_mask
+            depth_l1 = diff_depth_l1.sum() / valid_depth_mask.sum()
+        rmse_list.append(rmse.cpu().numpy())
+        l1_list.append(depth_l1.cpu().numpy())
+
+        # if load_semantics:
+        #     # Render semantic color map
+        #     semantic_rendervar = transformed_semantics2rendervar(final_params, transformed_pts, device=device)
+        #     rastered_seg, _, _, = Renderer(raster_settings=curr_data['cam'])(**semantic_rendervar)
+        #     gt_seg = curr_data['semantic_color']
+
+        #     # Calcualte mIoU scores
+        #     rastered_seg = recolor_semantic_img(rastered_seg, gt_seg)
+        #     miou = evaluate_miou(rastered_seg, gt_seg)
+        #     miou_list.append(miou)
+            
+            
+        if load_semantics and not use_one_hot_semantics:
+            semantic_rendervar = transformed_semantics2rendervar(final_params, transformed_pts, device=device)
+            rastered_seg, _, _, = Renderer(raster_settings=curr_data['cam'])(**semantic_rendervar)
+            gt_seg = curr_data['semantic_color']
+            # seg_psnr = calc_psnr(seg, data['semantic_color']).mean()
+            rastered_seg = recolor_semantic_img(rastered_seg, gt_seg)
+            miou = evaluate_miou(rastered_seg, gt_seg)
+            miou_list.append(miou)
+        elif load_semantics and use_one_hot_semantics:
+            mean, quat, scale, opac, renders = params_to_gsplat_inputs(final_params, transformed_pts,use_semantics=load_semantics,use_one_hot_semantics=use_one_hot_semantics)
+            H,W,K,view=curr_data['gscam']
+            RGBDS, alpha, meta = rasterization(
+                    mean, quat, scale, opac, renders, view, K, W, H,
+                    render_mode="RGB+D")
+            # im = RGBDS[..., :3]  # 取RGB部分，[1,1200,680,3]
+            # # print("im shape before squeeze:", im.shape)
+            # im = im.squeeze(0)               # 去掉第一维的1，变成 [1200, 680, 3]
+            # im = im.permute(2, 0, 1)
+            # rastered_seg = RGBDS[..., 3:55]
+            # rastered_seg = rastered_seg.squeeze(0).permute(2,0,1)
+            # depth = RGBDS[..., -1]  # 取深度部分，[1,1200,680]
+            # depth= depth.squeeze(0)  
+            gt_seg = curr_data['semantic_id']
+            miou,iou = evaluate_miou_onehot(rastered_seg, gt_seg)            
+            miou_list.append(miou)
+        else:
+            rastered_seg = None
+            gt_seg = None
+
+        if save_frames:
+            # Save Rendered RGB and Depth
+            viz_render_im = torch.clamp(im, 0, 1)
+            viz_render_im = viz_render_im.detach().cpu().permute(1, 2, 0).numpy()
+            vmin = 0
+            vmax = 6
+            viz_render_depth = rastered_depth_viz[0].detach().cpu().numpy()
+            normalized_depth = np.clip((viz_render_depth - vmin) / (vmax - vmin), 0, 1)
+            depth_colormap = cv2.applyColorMap((normalized_depth * 255).astype(np.uint8), cv2.COLORMAP_JET)
+            cv2.imwrite(os.path.join(render_rgb_dir, "gs_{:04d}.png".format(time_idx)), cv2.cvtColor(viz_render_im*255, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(os.path.join(render_depth_dir, "gs_{:04d}.png".format(time_idx)), depth_colormap)
+
+            if load_semantics and not use_one_hot_semantics:
+                viz_render_seg = torch.clamp(rastered_seg, 0, 1)
+                viz_render_seg = viz_render_seg.detach().cpu().permute(1, 2, 0).numpy()
+                cv2.imwrite(os.path.join(render_seg_dir, "gs_{:04d}.png".format(time_idx)), cv2.cvtColor(viz_render_seg*255, cv2.COLOR_RGB2BGR))
+            elif load_semantics and use_one_hot_semantics:
+                rastered_seg_vis, gt_seg_vis, palette = visualize_semantic_from_logits(
+                    rendered_logits=rastered_seg,  # [C,H,W]
+                    gt_seg=gt_seg,                 # [H,W] or [1,H,W]
+                    num_classes=num_semantic_classes if num_semantic_classes is not None else -1,
+                    temperature=1.0,
+                )
+
+                # Save both predicted and GT semantic maps using the fixed palette
+                rastered_seg_save = rastered_seg_vis.permute(1, 2, 0).contiguous().cpu().numpy()  # [H,W,3], uint8, RGB
+                gt_seg_save = gt_seg_vis.permute(1, 2, 0).contiguous().cpu().numpy()              # [H,W,3], uint8, RGB
+                bgr_pred = cv2.cvtColor(rastered_seg_save, cv2.COLOR_RGB2BGR)
+                bgr_gt = cv2.cvtColor(gt_seg_save, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(os.path.join(render_seg_dir, f"gs_{time_idx:04d}.png"), bgr_pred)
+                cv2.imwrite(os.path.join(render_seg_dir, f"gt_{time_idx:04d}.png"), bgr_gt)
+                
+        # Plot the Ground Truth and Rasterized RGB & Depth, along with Silhouette
+        fig_title = "Time Step: {}".format(time_idx)
+        plot_name = "%04d" % time_idx
+        presence_sil_mask = presence_sil_mask.detach().cpu().numpy()
+        # if wandb_run is None:
+        plot_rgbd_silhouette(color, depth, im, rastered_depth_viz, presence_sil_mask, diff_depth_l1,
+                                psnr, depth_l1, fig_title, plot_dir, plot_name=plot_name, save_plot=True,
+                                seg=gt_seg, rastered_seg=rastered_seg,use_one_hot_semantics=use_one_hot_semantics,miou=miou)
+        # elif wandb_save_qual:
+        #     plot_rgbd_silhouette(color, depth, im, rastered_depth_viz, presence_sil_mask, diff_depth_l1,
+        #                          psnr, depth_l1, fig_title, plot_dir, plot_name=plot_name, save_plot=True,
+        #                          seg=gt_seg, rastered_seg=rastered_seg, wandb_run=wandb_run, wandb_step=None, 
+        #                          wandb_title="Eval/Qual Viz",use_one_hot_semantics=use_one_hot_semantics,miou=miou)
+    
+    try:
+        # Compute the final ATE RMSE
+        # Get the final camera trajectory
+        num_frames = final_params['cam_unnorm_rots'].shape[-1]
+        latest_est_w2c = first_frame_w2c
+        latest_est_w2c_list = []
+        latest_est_w2c_list.append(latest_est_w2c)
+        valid_gt_w2c_list = []
+        valid_gt_w2c_list.append(gt_w2c_list[0])
+        for idx in range(1, num_frames):
+            # Check if gt pose is not nan for this time step
+            if torch.isnan(gt_w2c_list[idx]).sum() > 0:
+                continue
+            interm_cam_rot = F.normalize(final_params['cam_unnorm_rots'][..., idx].detach())
+            interm_cam_trans = final_params['cam_trans'][..., idx].detach()
+            intermrel_w2c = torch.eye(4).to(device).float()
+            intermrel_w2c[:3, :3] = build_rotation(interm_cam_rot)
+            intermrel_w2c[:3, 3] = interm_cam_trans
+            latest_est_w2c = intermrel_w2c
+            latest_est_w2c_list.append(latest_est_w2c)
+            valid_gt_w2c_list.append(gt_w2c_list[idx])
+        gt_w2c_list = valid_gt_w2c_list
+        # Calculate ATE RMSE
+        ate_rmse = evaluate_ate(gt_w2c_list, latest_est_w2c_list)
+        print("Final Average ATE RMSE: {:.2f} cm".format(ate_rmse*100))
+        if wandb_run is not None:
+            wandb_run.log({"Final Stats/Avg ATE RMSE": ate_rmse,
+                        "Final Stats/step": 1})
+    except:
+        ate_rmse = 100.0
+        print('Failed to evaluate trajectory with alignment.')
+    
+    # Compute Average Metrics
+    psnr_list = np.array(psnr_list)
+    rmse_list = np.array(rmse_list)
+    l1_list = np.array(l1_list)
+    ssim_list = np.array(ssim_list)
+    lpips_list = np.array(lpips_list)
+    miou_list = np.array(miou_list)
+
+    avg_psnr = psnr_list.mean()
+    avg_rmse = rmse_list.mean()
+    avg_l1 = l1_list.mean()
+    avg_ssim = ssim_list.mean()
+    avg_lpips = lpips_list.mean()
+    avg_miou = miou_list.mean() if miou_list.size > 0 else 0
+    avg_miou_stride10 = miou_list[::10].mean() if miou_list.size > 0 else 0
+    print("Average PSNR: {:.2f}".format(avg_psnr))
+    print("Average Depth RMSE: {:.2f} cm".format(avg_rmse*100))
+    print("Average Depth L1: {:.2f} cm".format(avg_l1*100))
+    print("Average MS-SSIM: {:.3f}".format(avg_ssim))
+    print("Average LPIPS: {:.3f}".format(avg_lpips))
+    print("Average mIoU: {:.4f}".format(avg_miou))
+    print("Average mIoU (stride 10): {:.4f}".format(avg_miou_stride10))
+
+    if wandb_run is not None:
+        wandb_run.log({"Final Stats/Average PSNR": avg_psnr,
+                        "Final Stats/Average Depth RMSE": avg_rmse,
+                        "Final Stats/Average Depth L1": avg_l1,
+                        "Final Stats/Average MS-SSIM": avg_ssim,
+                        "Final Stats/Average LPIPS": avg_lpips,
+                        "Final Stats/step": 1,
+                        "Final Stats/Average mIoU": avg_miou,
+                        "Final Stats/Average mIoU (stride 10)": avg_miou_stride10})
+
+    # Save metric lists as text files
+    np.savetxt(os.path.join(eval_dir, "psnr.txt"), psnr_list)
+    np.savetxt(os.path.join(eval_dir, "rmse.txt"), rmse_list)
+    np.savetxt(os.path.join(eval_dir, "l1.txt"), l1_list)
+    np.savetxt(os.path.join(eval_dir, "ssim.txt"), ssim_list)
+    np.savetxt(os.path.join(eval_dir, "lpips.txt"), lpips_list)
+
+    if load_semantics:
+        np.savetxt(os.path.join(eval_dir, "miou.txt"), miou_list)
+        fig, axs = plt.subplots(1, 3, figsize=(18, 4))
+        axs[2].plot(np.arange(len(miou_list)), miou_list)
+        axs[2].set_title("mIoU")
+        axs[2].set_xlabel("Time Step")
+        axs[2].set_ylabel("mIoU")
+    else:
+        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+
+    axs[0].plot(np.arange(len(psnr_list)), psnr_list)
+    axs[0].set_title("RGB PSNR")
+    axs[0].set_xlabel("Time Step")
+    axs[0].set_ylabel("PSNR")
+
+    axs[1].plot(np.arange(len(l1_list)), l1_list*100)
+    axs[1].set_title("Depth L1")
+    axs[1].set_xlabel("Time Step")
+    axs[1].set_ylabel("L1 (cm)")
+
+    fig.suptitle("Average PSNR: {:.2f}, Average Depth L1: {:.2f} cm, ATE RMSE: {:.2f} cm, Average mIoU: {:.4f}".format(
+        avg_psnr, avg_l1*100, ate_rmse*100, avg_miou), y=1.05, fontsize=16)
+
+    plt.savefig(os.path.join(eval_dir, "metrics.png"), bbox_inches='tight')
+    if wandb_run is not None:
+        wandb_run.log({"Eval/Metrics": fig})
+    plt.close()
+
+
+def eval_nvs(dataset, final_params, num_frames, eval_dir, sil_thres, mapping_iters, add_new_gaussians,
+             device="cuda", load_semantics=False, wandb_run=None, wandb_save_qual=False, eval_every=1,
+             save_frames=False, use_one_hot_semantics=False, num_semantic_classes=None):
+    print("Evaluating Final Parameters for Novel View Synthesis ...")
+    psnr_list = []
+    rmse_list = []
+    l1_list = []
+    lpips_list = []
+    ssim_list = []
+    valid_nvs_frames = []
+    miou_list = []
+    plot_dir = os.path.join(eval_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    if save_frames:
+        render_rgb_dir = os.path.join(eval_dir, "rendered_rgb")
+        os.makedirs(render_rgb_dir, exist_ok=True)
+        render_depth_dir = os.path.join(eval_dir, "rendered_depth")
+        os.makedirs(render_depth_dir, exist_ok=True)
+        # rgb_dir = os.path.join(eval_dir, "rgb")
+        # os.makedirs(rgb_dir, exist_ok=True)
+        # depth_dir = os.path.join(eval_dir, "depth")
+        # os.makedirs(depth_dir, exist_ok=True)
+
+        if load_semantics:
+            render_seg_dir = os.path.join(eval_dir, "rendered_semantic")
+            os.makedirs(render_seg_dir, exist_ok=True)
+            seg_dir = os.path.join(eval_dir, "semantic")
+            os.makedirs(seg_dir, exist_ok=True)
+
+    for time_idx in tqdm(range(num_frames)):
+         # Get RGB-D Data & Camera Parameters
+        if load_semantics:
+            color, depth, intrinsics, pose, semantic_id, semantic_color = dataset[time_idx]
+            semantic_id = semantic_id.permute(2, 0, 1) # (H, W, 1) -> (1, H, W)
+            semantic_color = semantic_color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
+        else:
+            color, depth, intrinsics, pose = dataset[time_idx]
+
+        gt_w2c = torch.linalg.inv(pose)
+        intrinsics = intrinsics[:3, :3]
+
+        # Process RGB-D Data
+        color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
+        depth = depth.permute(2, 0, 1) # (H, W, C) -> (C, H, W)
+
+        if time_idx == 0:
+            # Process Camera Parameters
+            first_frame_w2c = torch.linalg.inv(pose)
+            # Setup Camera
+            cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(),
+                               first_frame_w2c.detach().cpu().numpy(), device=device)
+            gs_cam = to_gsplat_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(),
+                                      first_frame_w2c.detach().cpu().numpy(), device=device)
+            # Skip first train frame eval for NVS
+            continue
+        
+        # Skip frames if not eval_every (indexing accounts for first training frame)
+        test_time_idx = time_idx - 1
+        if test_time_idx != 0 and (test_time_idx+1) % eval_every != 0:
+            continue
+
+        # Transform Centers of Gaussians to Camera Frame
+        pts = final_params['means3D'].detach()
+        pts_ones = torch.ones(pts.shape[0], 1).to(device).float()
+        pts4 = torch.cat((pts, pts_ones), dim=1)
+        transformed_pts = (gt_w2c @ pts4.T).T[:, :3]
+ 
+        # Define current frame data
+        curr_data = {
+            'cam': cam,
+            'im': color,
+            'depth': depth,
+            'id': time_idx,
+            'intrinsics': intrinsics,
+            'w2c': first_frame_w2c,
+            'gscam': gs_cam,
+        }
+        if load_semantics:
+            curr_data['semantic_id'] = semantic_id
+            curr_data['semantic_color'] = semantic_color
+
+        if not use_one_hot_semantics:
+            # Initialize Render Variables (original pipeline)
+            rendervar = transformed_params2rendervar(final_params, transformed_pts, device=device)
+            depth_sil_rendervar = transformed_params2depthplussilhouette(final_params, curr_data['w2c'],
+                                                                         transformed_pts, device=device)
+
+            # Render Depth & Silhouette
+            depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
+            rastered_depth = depth_sil[0, :, :].unsqueeze(0)
+            # Mask invalid depth in GT
+            valid_depth_mask = (curr_data['depth'] > 0)
+            rastered_depth_viz = rastered_depth.detach()
+            rastered_depth = rastered_depth * valid_depth_mask
+            silhouette = depth_sil[1, :, :]
+            presence_sil_mask = (silhouette > sil_thres)
+
+            # Render RGB
+            im, _, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+        else:
+            # GSplat rendering path with one-hot semantics support
+            mean, quat, scale, opac, renders = params_to_gsplat_inputs(
+                final_params, transformed_pts,
+                use_semantics=load_semantics,
+                use_one_hot_semantics=use_one_hot_semantics)
+            H, W, K, view = curr_data['gscam']
+            RGBDS, alpha, meta = rasterization(
+                mean, quat, scale, opac, renders, view, K, W, H,
+                render_mode="RGB+D")
+            im = RGBDS[..., :3]
+            im = im.squeeze(0).permute(2, 0, 1)
+
+            rastered_seg = RGBDS[..., 3:-1]
+            rastered_seg = rastered_seg.squeeze(0).permute(2, 0, 1)
+
+            valid_depth_mask = (curr_data['depth'] > 0)
+            rastered_depth = RGBDS[..., -1]
+            rastered_depth_viz = rastered_depth.detach()
+
+            silhouette = alpha[0] if alpha.ndim == 4 else alpha
+            silhouette = silhouette.squeeze(0).permute(2, 0, 1)
+            presence_sil_mask = (silhouette > sil_thres)
+
+        # Check if Novel View is Valid based on Silhouette & Valid Depth Mask
+        valid_region_mask = presence_sil_mask | ~valid_depth_mask
+        percent_holes = (~valid_region_mask).sum() / valid_region_mask.numel() * 100
+        if percent_holes > 0.1:
+            valid_nvs_frames.append(False)
+        else:
+            valid_nvs_frames.append(True)
+        
+        # Calculate image quality metrics
+        if mapping_iters==0 and not add_new_gaussians:
+            weighted_im = im * presence_sil_mask * valid_depth_mask
+            weighted_gt_im = curr_data['im'] * presence_sil_mask * valid_depth_mask
+        else:
+            weighted_im = im * valid_depth_mask
+            weighted_gt_im = curr_data['im'] * valid_depth_mask
+        diff_rgb = torch.abs(weighted_im - weighted_gt_im).mean(dim=0).detach()
+        psnr = calc_psnr(weighted_im, weighted_gt_im).mean()
+        ssim = ms_ssim(weighted_im.unsqueeze(0).cpu(), weighted_gt_im.unsqueeze(0).cpu(), 
+                        data_range=1.0, size_average=True)
+        loss_fn_alex.to(device)
+        lpips_score = loss_fn_alex(torch.clamp(weighted_im.unsqueeze(0), 0.0, 1.0),
+                                    torch.clamp(weighted_gt_im.unsqueeze(0), 0.0, 1.0)).item()
+
+        psnr_list.append(psnr.cpu().numpy())
+        ssim_list.append(ssim.cpu().numpy())
+        lpips_list.append(lpips_score)
+
+        # Compute Depth RMSE
+        if mapping_iters==0 and not add_new_gaussians:
+            diff_depth_rmse = torch.sqrt((((rastered_depth - curr_data['depth']) * presence_sil_mask) ** 2))
+            diff_depth_rmse = diff_depth_rmse * valid_depth_mask
+            rmse = diff_depth_rmse.sum() / valid_depth_mask.sum()
+            diff_depth_l1 = torch.abs((rastered_depth - curr_data['depth']) * presence_sil_mask)
+            diff_depth_l1 = diff_depth_l1 * valid_depth_mask
+            depth_l1 = diff_depth_l1.sum() / valid_depth_mask.sum()
+        else:
+            diff_depth_rmse = torch.sqrt((((rastered_depth - curr_data['depth'])) ** 2))
+            diff_depth_rmse = diff_depth_rmse * valid_depth_mask
+            rmse = diff_depth_rmse.sum() / valid_depth_mask.sum()
+            diff_depth_l1 = torch.abs((rastered_depth - curr_data['depth']))
+            diff_depth_l1 = diff_depth_l1 * valid_depth_mask
+            depth_l1 = diff_depth_l1.sum() / valid_depth_mask.sum()
+        rmse_list.append(rmse.cpu().numpy())
+        l1_list.append(depth_l1.cpu().numpy())
+
+        if load_semantics and not use_one_hot_semantics:
+            semantic_rendervar = transformed_semantics2rendervar(final_params, transformed_pts, device=device)
+            rastered_seg, _, _, = Renderer(raster_settings=curr_data['cam'])(**semantic_rendervar)
+            gt_seg = curr_data['semantic_color']
+            rastered_seg = recolor_semantic_img(rastered_seg, gt_seg)
+            miou = evaluate_miou(rastered_seg, gt_seg)
+            miou_list.append(miou)
+        elif load_semantics and use_one_hot_semantics:
+            gt_seg = curr_data['semantic_id']
+            miou, iou = evaluate_miou_onehot(rastered_seg, gt_seg)
+            miou_list.append(miou)
+        else:
+            rastered_seg = None
+            gt_seg = None
+
+        if save_frames:
+            # Save Rendered RGB and Depth
+            viz_render_im = torch.clamp(im, 0, 1)
+            viz_render_im = viz_render_im.detach().cpu().permute(1, 2, 0).numpy()
+            vmin = 0
+            vmax = 6
+            viz_render_depth = rastered_depth_viz[0].detach().cpu().numpy() if rastered_depth_viz.ndim==3 else rastered_depth_viz.detach().cpu().numpy()
+            normalized_depth = np.clip((viz_render_depth - vmin) / (vmax - vmin), 0, 1)
+            depth_colormap = cv2.applyColorMap((normalized_depth * 255).astype(np.uint8), cv2.COLORMAP_JET)
+            cv2.imwrite(os.path.join(render_rgb_dir, "rgb_{:04d}.png".format(test_time_idx)), cv2.cvtColor(viz_render_im*255, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(os.path.join(render_depth_dir, "depth_{:04d}.png".format(test_time_idx)), depth_colormap)
+
+            # Save GT RGB and Depth
+            # viz_gt_im = torch.clamp(curr_data['im'], 0, 1)
+            # viz_gt_im = viz_gt_im.detach().cpu().permute(1, 2, 0).numpy()
+            # viz_gt_depth = curr_data['depth'][0].detach().cpu().numpy()
+            # normalized_depth = np.clip((viz_gt_depth - vmin) / (vmax - vmin), 0, 1)
+            # depth_colormap = cv2.applyColorMap((normalized_depth * 255).astype(np.uint8), cv2.COLORMAP_JET)
+            # cv2.imwrite(os.path.join(rgb_dir, "gt_{:04d}.png".format(test_time_idx)), cv2.cvtColor(viz_gt_im*255, cv2.COLOR_RGB2BGR))
+            # cv2.imwrite(os.path.join(depth_dir, "gt_{:04d}.png".format(test_time_idx)), depth_colormap)
+
+            if load_semantics and not use_one_hot_semantics:
+                viz_render_seg = torch.clamp(rastered_seg, 0, 1)
+                viz_render_seg = viz_render_seg.detach().cpu().permute(1, 2, 0).numpy()
+                cv2.imwrite(os.path.join(render_seg_dir, "seg_{:04d}.png".format(test_time_idx)), cv2.cvtColor(viz_render_seg*255, cv2.COLOR_RGB2BGR))
+            elif load_semantics and use_one_hot_semantics:
+                rastered_seg_vis, gt_seg_vis, palette = visualize_semantic_from_logits(
+                    rendered_logits=rastered_seg,
+                    gt_seg=gt_seg,
+                    num_classes=num_semantic_classes if num_semantic_classes is not None else -1,
+                    temperature=1.0,
+                )
+                rastered_seg_save = rastered_seg_vis.permute(1, 2, 0).contiguous().cpu().numpy()
+                gt_seg_save = gt_seg_vis.permute(1, 2, 0).contiguous().cpu().numpy()
+                bgr_pred = cv2.cvtColor(rastered_seg_save, cv2.COLOR_RGB2BGR)
+                bgr_gt = cv2.cvtColor(gt_seg_save, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(os.path.join(render_seg_dir, f"seg_{test_time_idx:04d}.png"), bgr_pred)
+                cv2.imwrite(os.path.join(render_seg_dir, f"gt_{test_time_idx:04d}.png"), bgr_gt)
+        
+        # Plot the Ground Truth and Rasterized RGB & Depth, along with Silhouette
+        fig_title = "Time Step: {}".format(test_time_idx)
+        plot_name = "%04d" % test_time_idx
+        presence_sil_mask = presence_sil_mask.detach().cpu().numpy()
+        if wandb_run is None:
+            plot_rgbd_silhouette(color, depth, im, rastered_depth_viz, presence_sil_mask, diff_depth_l1,
+                                 psnr, depth_l1, fig_title, plot_dir, plot_name=plot_name, save_plot=True,
+                                 seg=gt_seg, rastered_seg=rastered_seg,
+                                 use_one_hot_semantics=use_one_hot_semantics, miou=miou if load_semantics else 0)
+        elif wandb_save_qual:
+            plot_rgbd_silhouette(color, depth, im, rastered_depth_viz, presence_sil_mask, diff_depth_l1,
+                                 psnr, depth_l1, fig_title, plot_dir, plot_name=plot_name, save_plot=True,
+                                 seg=gt_seg, rastered_seg=rastered_seg, wandb_run=wandb_run, wandb_step=None, 
+                                 wandb_title="Eval/Qual Viz", use_one_hot_semantics=use_one_hot_semantics,
+                                 miou=miou if load_semantics else 0)
+
+    # Compute Average Metrics based on valid NVS frames
+    psnr_list = np.array(psnr_list)
+    rmse_list = np.array(rmse_list)
+    l1_list = np.array(l1_list)
+    ssim_list = np.array(ssim_list)
+    lpips_list = np.array(lpips_list)
+    valid_nvs_frames = np.array(valid_nvs_frames)
+    miou_list = np.array(miou_list)
+
+    avg_psnr = psnr_list[valid_nvs_frames].mean()
+    avg_rmse = rmse_list[valid_nvs_frames].mean()
+    avg_l1 = l1_list[valid_nvs_frames].mean()
+    avg_ssim = ssim_list[valid_nvs_frames].mean()
+    avg_lpips = lpips_list[valid_nvs_frames].mean()
+    avg_miou = miou_list.mean() if miou_list.size > 0 else 0
+    print("Average PSNR: {:.2f}".format(avg_psnr))
+    print("Average Depth RMSE: {:.2f} cm".format(avg_rmse*100))
+    print("Average Depth L1: {:.2f} cm".format(avg_l1*100))
+    print("Average MS-SSIM: {:.3f}".format(avg_ssim))
+    print("Average LPIPS: {:.3f}".format(avg_lpips))
+    print("Average mIoU: {:.4f}".format(avg_miou))
+
+    if wandb_run is not None:
+        wandb_run.log({"Final Stats/Average PSNR": avg_psnr, 
+                       "Final Stats/Average Depth RMSE": avg_rmse,
+                       "Final Stats/Average Depth L1": avg_l1,
+                       "Final Stats/Average MS-SSIM": avg_ssim, 
+                       "Final Stats/Average LPIPS": avg_lpips,
+                       "Final Stats/step": 1,
+                       "Final Stats/Average mIoU": avg_miou})
+
+    # Save metric lists as text files
+    np.savetxt(os.path.join(eval_dir, "psnr.txt"), psnr_list)
+    np.savetxt(os.path.join(eval_dir, "rmse.txt"), rmse_list)
+    np.savetxt(os.path.join(eval_dir, "l1.txt"), l1_list)
+    np.savetxt(os.path.join(eval_dir, "ssim.txt"), ssim_list)
+    np.savetxt(os.path.join(eval_dir, "lpips.txt"), lpips_list)
+
+    # Save metadata for valid NVS frames
+    np.save(os.path.join(eval_dir, "valid_nvs_frames.npy"), valid_nvs_frames)
+
+    if load_semantics:
+        np.savetxt(os.path.join(eval_dir, "miou.txt"), miou_list)
+
+        fig, axs = plt.subplots(1, 3, figsize=(18, 4))
+        axs[2].plot(np.arange(len(miou_list)), miou_list)
+        axs[2].set_title("mIoU")
+        axs[2].set_xlabel("Time Step")
+        axs[2].set_ylabel("mIoU")
+    else:
+        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+
+    # Plot PSNR & L1 as line plots
+    axs[0].plot(np.arange(len(psnr_list)), psnr_list)
+    axs[0].set_title("RGB PSNR")
+    axs[0].set_xlabel("Time Step")
+    axs[0].set_ylabel("PSNR")
+    axs[1].plot(np.arange(len(l1_list)), l1_list*100)
+    axs[1].set_title("Depth L1")
+    axs[1].set_xlabel("Time Step")
+    axs[1].set_ylabel("L1 (cm)")
+    fig.suptitle("Average PSNR: {:.2f}, Average Depth L1: {:.2f} cm, Average mIoU: {:.4f}".format(avg_psnr, avg_l1*100, avg_miou),
+                  y=1.05, fontsize=16)
+    plt.savefig(os.path.join(eval_dir, "metrics.png"), bbox_inches='tight')
+    if wandb_run is not None:
+        wandb_run.log({"Eval/Metrics": fig})
+    plt.close()

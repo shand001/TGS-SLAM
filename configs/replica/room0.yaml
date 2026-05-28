@@ -1,0 +1,5 @@
+inherit_from: configs/replica/replica.yaml
+mapping:
+  bound: [[-1.9,7.9],[-2.2,4.5],[-2.5,2.3]]
+
+

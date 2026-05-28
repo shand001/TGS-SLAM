@@ -1,0 +1,5 @@
+inherit_from: configs/replica/replica.yaml
+mapping:
+  bound: [[-4.5,4.9],[-5.7,4.4],[-3.7,4.3]]
+  marching_cubes_bound: [[-4.5,4.9],[-5.7,4.4],[-3.7,4.3]]
+
