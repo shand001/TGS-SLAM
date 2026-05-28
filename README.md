@@ -7,10 +7,15 @@
 </p>
 
 <p align="center">
+  Accepted for publication in <b>IEEE Robotics and Automation Letters</b> (April 2026).
+</p>
+
+<p align="center">
   <b>TGS-SLAM</b> is a semantic RGB-D SLAM system that anchors geometry and appearance with 3D Gaussians while encoding semantics in TriDS, a shared coarse-to-fine tri-plane field decoupled from Gaussian primitives.
 </p>
 
 <p align="center">
+  <a href="https://doi.org/10.1109/LRA.2026.3692078"><b>Paper</b></a> ·
   <a href="#installation">Installation</a> ·
   <a href="#data-preparation">Data Preparation</a> ·
   <a href="#quick-start">Quick Start</a> ·
@@ -22,14 +27,24 @@
 
 ## Overview
 
-Semantic SLAM needs both geometric fidelity and semantic consistency. TGS-SLAM combines 3D Gaussian Splatting for efficient scene representation with TriDS for shared semantic decoding, so semantic features are queried at Gaussian centers and splatted together with color and depth in one rendering pass.
+Semantic SLAM aims to build 3D maps that are both geometrically accurate and semantically consistent. TGS-SLAM combines 3D Gaussian Splatting for efficient scene representation with TriDS for shared semantic decoding, so semantic features are queried at Gaussian centers and splatted together with color and depth in a single rendering pass.
 
 ### Highlights
 
-- Geometry and appearance anchored by 3D Gaussians
-- Semantics represented by a shared tri-plane field instead of per-Gaussian labels
-- Geometry-first optimization for stable map initialization
-- Hybrid pose initialization for robust tracking
+- Geometry and appearance are anchored by 3D Gaussians, while semantics live in a shared TriDS field
+- Semantic storage is decoupled from the number of Gaussian primitives, reducing memory overhead and label fragmentation
+- Geometry-first, two-stage optimization delays semantic learning until the Gaussian map is stable
+- Hybrid tracking combines constant-velocity prediction with ORB+PnP proposals selected by render-based scoring
+
+## Key Results
+
+| Setting | Result |
+| --- | --- |
+| Replica semantic mIoU | 97.02% |
+| Replica ATE / Depth L1 | 0.33 cm / 0.47 cm |
+| Replica PSNR / SSIM | 35.82 dB / 0.983 |
+| Semantic parameter size on Replica | 10 MB |
+| One-hot semantic baseline | 1059 MB |
 
 ## Demo
 
@@ -196,6 +211,21 @@ python scripts/slam.py configs/replica/slam.py
 ```
 
 Other utility scripts are available under `scripts/` for rendering, evaluation, and point cloud generation.
+
+After a successful run, results are written to an experiment directory such as:
+
+```text
+experiments/Replica/room0_0_20260528_1149/
+```
+
+Typical outputs in that folder are:
+
+- `config.py`: the resolved run configuration
+- `params.npz`, `planes.pth`, `decoder.pth`: the main saved checkpoints
+- `eval/`: the evaluation summary, rendered RGB/depth/segmentation outputs, and metric files
+- `tsdf_pointcloud/`: the exported point cloud and mesh results
+
+The timestamped suffix in the experiment folder name changes from run to run.
 
 ## Citation
 
